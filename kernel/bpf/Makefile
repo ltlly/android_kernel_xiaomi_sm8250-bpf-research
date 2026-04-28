@@ -29,7 +29,9 @@ ifeq ($(CONFIG_INET),y)
 obj-$(CONFIG_BPF_SYSCALL) += reuseport_array.o
 endif
 ifeq ($(CONFIG_SYSFS),y)
-obj-$(CONFIG_DEBUG_INFO_BTF) += sysfs_btf.o
+# 4.19-research-fork: always build sysfs_btf so /sys/kernel/btf/vmlinux
+# becomes available once btf_parse_vmlinux() loads BTF from FS.
+obj-$(CONFIG_BPF_SYSCALL) += sysfs_btf.o
 endif
 ifeq ($(CONFIG_BPF_JIT),y)
 obj-$(CONFIG_BPF_SYSCALL) += bpf_struct_ops.o

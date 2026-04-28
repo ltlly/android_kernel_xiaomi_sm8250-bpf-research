@@ -4201,6 +4201,19 @@ extern char __weak __start_BTF[];
 extern char __weak __stop_BTF[];
 extern struct btf *btf_vmlinux;
 
+/* 4.19-research-fork: accessor for sysfs_btf.c so it can serve our FS-loaded
+ * BTF data via /sys/kernel/btf/vmlinux without needing struct btf internals. */
+void *ksu_btf_vmlinux_data(u32 *size_out)
+{
+	if (!btf_vmlinux || IS_ERR(btf_vmlinux)) {
+		*size_out = 0;
+		return NULL;
+	}
+	*size_out = btf_vmlinux->data_size;
+	return btf_vmlinux->data;
+}
+EXPORT_SYMBOL_GPL(ksu_btf_vmlinux_data);
+
 #define BPF_MAP_TYPE(_id, _ops)
 #define BPF_LINK_TYPE(_id, _name)
 static union {
@@ -4475,6 +4488,14 @@ struct btf *btf_parse_vmlinux(void)
 
 	bpf_struct_ops_init(btf, log);
 	pr_info("btf: btf_parse_vmlinux SUCCESS, %u types\n", btf->nr_types);
+
+	/* 4.19-research-fork: now that btf is parsed, expose its raw data
+	 * via /sys/kernel/btf/vmlinux so userspace libbpf can find it.
+	 * Defined in sysfs_btf.c. */
+	{
+		extern int ksu_btf_sysfs_register(u32 size);
+		(void)ksu_btf_sysfs_register(btf->data_size);
+	}
 
 	btf_verifier_env_free(env);
 	refcount_set(&btf->refcnt, 1);
