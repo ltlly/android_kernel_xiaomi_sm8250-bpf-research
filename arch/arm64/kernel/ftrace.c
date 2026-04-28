@@ -51,34 +51,18 @@ static int ftrace_modify_code(unsigned long pc, u32 old, u32 new,
 }
 
 /*
- * Replace tracer function in ftrace_caller() and ftrace_regs_caller().
- *
- * KSU/BPF backport: with HAVE_DYNAMIC_FTRACE_WITH_REGS we have two parallel
- * patch sites — ftrace_call (inside ftrace_caller) and ftrace_regs_call
- * (inside ftrace_regs_caller). Both must be redirected to the same callback
- * so a record routed to either trampoline ends up at the same handler.
+ * Replace tracer function in ftrace_caller()
  */
 int ftrace_update_ftrace_func(ftrace_func_t func)
 {
 	unsigned long pc;
 	u32 new;
-	int ret;
 
 	pc = (unsigned long)__va_function(ftrace_call);
 	new = aarch64_insn_gen_branch_imm(pc, (unsigned long)func,
 					  AARCH64_INSN_BRANCH_LINK);
-	ret = ftrace_modify_code(pc, 0, new, false);
 
-#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
-	if (!ret) {
-		pc = (unsigned long)__va_function(ftrace_regs_call);
-		new = aarch64_insn_gen_branch_imm(pc, (unsigned long)func,
-						  AARCH64_INSN_BRANCH_LINK);
-		ret = ftrace_modify_code(pc, 0, new, false);
-	}
-#endif
-
-	return ret;
+	return ftrace_modify_code(pc, 0, new, false);
 }
 
 /*
@@ -161,37 +145,6 @@ int ftrace_make_call(struct dyn_ftrace *rec, unsigned long addr)
 /*
  * Turn off the call to ftrace_caller() in instrumented function
  */
-#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
-/*
- * KSU/BPF backport: switch the bl at rec->ip between ftrace_caller and
- * ftrace_regs_caller. Used by ftrace core when toggling FTRACE_FL_REGS.
- *
- * Module records are not supported: a module's PLT trampoline only carries
- * a single far-jump target (ftrace_caller), so if the kernel-text symbol is
- * out of range from rec->ip we return -EINVAL and ftrace falls back to the
- * regular (non-regs) path for that record.
- */
-int ftrace_modify_call(struct dyn_ftrace *rec, unsigned long old_addr,
-		       unsigned long new_addr)
-{
-	unsigned long pc = rec->ip;
-	u32 old, new;
-	long off_new = (long)new_addr - (long)pc;
-	long off_old = (long)old_addr - (long)pc;
-
-	if (off_new < -SZ_128M || off_new >= SZ_128M ||
-	    off_old < -SZ_128M || off_old >= SZ_128M)
-		return -EINVAL;
-
-	old = aarch64_insn_gen_branch_imm(pc, old_addr,
-					  AARCH64_INSN_BRANCH_LINK);
-	new = aarch64_insn_gen_branch_imm(pc, new_addr,
-					  AARCH64_INSN_BRANCH_LINK);
-
-	return ftrace_modify_code(pc, old, new, true);
-}
-#endif /* CONFIG_DYNAMIC_FTRACE_WITH_REGS */
-
 int ftrace_make_nop(struct module *mod, struct dyn_ftrace *rec,
 		    unsigned long addr)
 {

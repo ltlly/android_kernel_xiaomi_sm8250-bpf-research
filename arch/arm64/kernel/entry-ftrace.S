@@ -140,20 +140,15 @@ ENDPROC(_mcount)
  * makes calls to:
  *     - tracer function to probe instrumented function's entry,
  *     - ftrace_graph_caller to set up an exit hook
- *
- * KSU/BPF backport: with ARCH_SUPPORTS_FTRACE_OPS=1, callbacks have signature
- * (ip, parent_ip, op, regs). We pass function_trace_op in x2 and NULL regs in x3.
  */
 ENTRY(ftrace_caller)
 	mcount_enter
 
 	mcount_get_pc0	x0		//     function's pc
 	mcount_get_lr	x1		//     function's lr
-	ldr_l		x2, function_trace_op  // op = function_trace_op
-	mov		x3, xzr		//     regs = NULL
 
 	.global ftrace_call
-ftrace_call:				// tracer(pc, lr, op, NULL);
+ftrace_call:				// tracer(pc, lr);
 	nop				// This will be replaced with "bl xxx"
 					// where xxx can be any kind of tracer.
 
@@ -166,78 +161,6 @@ ftrace_graph_call:			// ftrace_graph_caller();
 
 	mcount_exit
 ENDPROC(ftrace_caller)
-
-/*
- * void ftrace_regs_caller(unsigned long return_address)
- *
- * KSU/BPF backport of HAVE_DYNAMIC_FTRACE_WITH_REGS for arm64 4.19.
- * Saves a struct pt_regs snapshot at mcount-entry on the stack and passes
- * its address as the 4th argument to the tracer. ftrace_modify_call() in
- * arch/arm64/kernel/ftrace.c switches the patch site at rec->ip between
- * `bl ftrace_caller` and `bl ftrace_regs_caller` based on FTRACE_FL_REGS.
- *
- * NOTE on x0: at mcount entry x0 has been clobbered by the instrumented
- * function's `mov x0, x30` to pass the parent return address to mcount.
- * regs->regs[0] therefore reflects parent_pc, NOT the function's first arg.
- * regs->regs[1..7] hold the original function arguments (the compiler spills
- * x0 to a callee-saved register before clobbering it but does not touch x1..x7).
- */
-ENTRY(ftrace_regs_caller)
-	mcount_enter			// stp x29, x30; mov x29, sp
-
-	sub	sp, sp, #S_FRAME_SIZE	// alloc pt_regs below the mcount frame
-
-	stp	x0, x1, [sp, #S_X0]
-	stp	x2, x3, [sp, #S_X2]
-	stp	x4, x5, [sp, #S_X4]
-	stp	x6, x7, [sp, #S_X6]
-	stp	x8, x9, [sp, #S_X8]
-	stp	x10, x11, [sp, #S_X10]
-	stp	x12, x13, [sp, #S_X12]
-	stp	x14, x15, [sp, #S_X14]
-	stp	x16, x17, [sp, #S_X16]
-	stp	x18, x19, [sp, #S_X18]
-	stp	x20, x21, [sp, #S_X20]
-	stp	x22, x23, [sp, #S_X22]
-	stp	x24, x25, [sp, #S_X24]
-	stp	x26, x27, [sp, #S_X26]
-
-	/* Recover the instrumented function's saved x29/x30 from the mcount
-	 * frame (which is just above our pt_regs frame). */
-	ldr	x9, [x29, #0]		// x9  = instrumented function's x29
-	ldr	x10, [x29, #8]		// x10 = instrumented function's x30 (= patch + 4)
-
-	stp	x28, x9, [sp, #S_X28]	// regs[28]=x28; regs[29]=saved x29
-	str	x10, [sp, #S_LR]	// regs[30]=saved x30
-
-	add	x11, x29, #16		// caller sp = mcount sp + 16
-	str	x11, [sp, #S_SP]
-
-	sub	x11, x10, #4		// pc = patch site = saved x30 - 4
-	str	x11, [sp, #S_PC]
-
-	mrs	x9, nzcv
-	str	x9, [sp, #S_PSTATE]
-
-	str	xzr, [sp, #S_ORIG_X0]
-	str	xzr, [sp, #S_ORIG_ADDR_LIMIT]
-	stp	xzr, xzr, [sp, #S_STACKFRAME]
-
-	/* Build callback args */
-	sub	x0, x10, #4		// ip   = patch site
-	ldr	x11, [x29, #0]		// instrumented function's fp
-	ldr	x1, [x11, #8]		// parent_ip = parent's lr
-	ldr_l	x2, function_trace_op	// op   = function_trace_op
-	mov	x3, sp			// regs = pt_regs *
-
-	.global ftrace_regs_call
-ftrace_regs_call:			// tracer(pc, lr, op, regs);
-	nop				// patched to bl <tracer>
-
-	add	sp, sp, #S_FRAME_SIZE	// pop pt_regs
-
-	mcount_exit
-ENDPROC(ftrace_regs_caller)
 #endif /* CONFIG_DYNAMIC_FTRACE */
 
 ENTRY(ftrace_stub)

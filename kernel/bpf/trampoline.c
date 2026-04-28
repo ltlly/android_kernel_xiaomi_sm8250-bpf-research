@@ -133,18 +133,11 @@ ksu_bpf_ftrace_handler(unsigned long ip, unsigned long parent_ip,
 	void *ctx_args;
 
 	/*
-	 * With our 4.19 arm64 HAVE_DYNAMIC_FTRACE_WITH_REGS backport,
-	 * `regs` is non-NULL and reflects state at the bl _mcount call site.
-	 * regs->regs[1..7] hold the original function argument registers.
-	 * regs->regs[0] is parent_pc (the instrumented function's prologue
-	 * does `mov x0, x30; bl _mcount`, clobbering the original arg0
-	 * before we get here). BPF programs reading ctx[0] should treat it
-	 * as parent_pc, not as the function's first arg.
-	 *
-	 * Fallback path (regs == NULL): can occur when the record happens to
-	 * be in a module whose PLT trampoline only carries ftrace_caller, so
-	 * ftrace_modify_call to ftrace_regs_caller fails and the record stays
-	 * on the non-regs caller. Pass a zero-filled args buffer.
+	 * 4.19 arm64 lacks HAVE_DYNAMIC_FTRACE_WITH_REGS, so `regs` will be
+	 * NULL here. Pass a zero-filled args buffer as the ctx pointer — the
+	 * BPF prog still gets to run, with the obvious caveat that arg
+	 * register values are not available. Hooks that only do bookkeeping
+	 * (counters, bpf_printk, map updates with constants) still work.
 	 */
 	if (regs)
 		ctx_args = &regs->regs[0];
@@ -201,17 +194,11 @@ static int ksu_register_ftrace_adapter(struct bpf_trampoline *tr, void *ip)
 	}
 	ad->tr = tr;
 	ad->ops.func = ksu_bpf_ftrace_handler;
-	/*
-	 * We have a 4.19 arm64 backport of HAVE_DYNAMIC_FTRACE_WITH_REGS
-	 * (entry-ftrace.S adds ftrace_regs_caller; ftrace.c implements
-	 * ftrace_modify_call). Set FL_SAVE_REGS so ftrace flips the patch
-	 * site to ftrace_regs_caller; FL_SAVE_REGS_IF_SUPPORTED is included
-	 * so registration also succeeds on builds without the WITH_REGS
-	 * backport (handler then sees regs == NULL and falls back to a
-	 * zero-filled args buffer).
-	 */
-	ad->ops.flags = FTRACE_OPS_FL_SAVE_REGS |
-			FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED |
+	/* 4.19 arm64 doesn't support FTRACE_OPS_FL_SAVE_REGS (no
+	 * HAVE_DYNAMIC_FTRACE_WITH_REGS). Use SAVE_REGS_IF_SUPPORTED so the
+	 * registration succeeds; the handler treats the absence of regs
+	 * gracefully. */
+	ad->ops.flags = FTRACE_OPS_FL_SAVE_REGS_IF_SUPPORTED |
 			FTRACE_OPS_FL_DYNAMIC;
 
 	err = ftrace_set_filter_ip(&ad->ops, (unsigned long)ip, 0, 0);
