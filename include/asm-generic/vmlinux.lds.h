@@ -112,9 +112,17 @@
 #endif
 
 #ifdef CONFIG_FTRACE_MCOUNT_RECORD
+/*
+ * The patchable_function_entries section also has to be considered when
+ * CONFIG_DYNAMIC_FTRACE_WITH_REGS=y on archs using -fpatchable-function-entry=N
+ * (e.g. arm64 5.5+ port). The compiler emits mcount records into that section
+ * instead of __mcount_loc, but ftrace consumes both ranges as a single sorted
+ * table delimited by __start_mcount_loc / __stop_mcount_loc.
+ */
 #define MCOUNT_REC()	. = ALIGN(8);				\
 			__start_mcount_loc = .;			\
 			KEEP(*(__mcount_loc))			\
+			KEEP(*(__patchable_function_entries))	\
 			__stop_mcount_loc = .;
 #else
 #define MCOUNT_REC()
