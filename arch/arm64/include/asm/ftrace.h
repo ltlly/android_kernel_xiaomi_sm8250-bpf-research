@@ -16,6 +16,20 @@
 #define MCOUNT_ADDR		((unsigned long)_mcount)
 #define MCOUNT_INSN_SIZE	AARCH64_INSN_SIZE
 
+/*
+ * KSU/BPF: arm64 4.19 backport of HAVE_DYNAMIC_FTRACE_WITH_REGS.
+ * ftrace_caller now loads function_trace_op into x2 and passes a NULL pt_regs
+ * pointer (x3=0). ftrace_regs_caller saves a full pt_regs frame on entry and
+ * passes its address as x3, so callbacks registered with FTRACE_OPS_FL_SAVE_REGS
+ * can read regs->regs[0..30].
+ *
+ * Caveat: x0 at mcount entry is the parent_pc (the instrumented function does
+ * `mov x0, x30; bl _mcount`), so regs->regs[0] is NOT the function's first arg.
+ * regs->regs[1..7] are the original argument registers since the compiler
+ * spills x0 to a callee-saved reg before clobbering it but doesn't touch x1..x7.
+ */
+#define ARCH_SUPPORTS_FTRACE_OPS 1
+
 #ifndef __ASSEMBLY__
 #include <linux/compat.h>
 
