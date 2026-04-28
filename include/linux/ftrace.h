@@ -271,7 +271,10 @@ int ftrace_modify_direct_caller(struct ftrace_func_entry *entry,
 				struct dyn_ftrace *rec,
 				unsigned long old_addr,
 				unsigned long new_addr);
+int register_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr);
+int unregister_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr);
 #else
+struct ftrace_ops;
 static inline int register_ftrace_direct(unsigned long ip, unsigned long addr)
 {
 	return -ENOTSUPP;
@@ -293,6 +296,14 @@ static inline int ftrace_modify_direct_caller(struct ftrace_func_entry *entry,
 					      struct dyn_ftrace *rec,
 					      unsigned long old_addr,
 					      unsigned long new_addr)
+{
+	return -ENODEV;
+}
+static inline int register_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr)
+{
+	return -ENODEV;
+}
+static inline int unregister_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr)
 {
 	return -ENODEV;
 }

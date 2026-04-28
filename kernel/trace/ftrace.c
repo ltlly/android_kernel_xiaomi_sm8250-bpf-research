@@ -14,6 +14,7 @@
  *  Copyright (C) 2004 Nadia Yvette Chambers
  */
 
+#include <linux/sizes.h>
 #include <linux/stop_machine.h>
 #include <linux/clocksource.h>
 #include <linux/sched/task.h>
@@ -2437,6 +2438,45 @@ static unsigned long find_rec_direct(unsigned long ip)
 	return entry->direct;
 }
 
+/*
+ * 4.19-research-fork: backport of mainline 1904a8144598 helper
+ * (factors hash-resize + insert logic so register_ftrace_direct_multi
+ * can share it with register_ftrace_direct).
+ */
+static struct ftrace_func_entry *
+ftrace_add_rec_direct(unsigned long ip, unsigned long addr,
+		      struct ftrace_hash **free_hash)
+{
+	struct ftrace_func_entry *entry;
+
+	if (ftrace_hash_empty(direct_functions) ||
+	    direct_functions->count > 2 * (1 << direct_functions->size_bits)) {
+		struct ftrace_hash *new_hash;
+		int size = ftrace_hash_empty(direct_functions) ? 0 :
+			direct_functions->count + 1;
+
+		if (size < 32)
+			size = 32;
+
+		new_hash = alloc_and_copy_ftrace_hash(
+			fls(size > 1 ? size - 1 : 1), direct_functions);
+		if (!new_hash)
+			return NULL;
+
+		*free_hash = direct_functions;
+		direct_functions = new_hash;
+	}
+
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return NULL;
+
+	entry->ip = ip;
+	entry->direct = addr;
+	__add_hash_entry(direct_functions, entry);
+	return entry;
+}
+
 static void call_direct_funcs(unsigned long ip, unsigned long pip,
 			      struct ftrace_ops *ops, struct pt_regs *regs)
 {
@@ -2477,12 +2517,29 @@ unsigned long ftrace_get_addr_new(struct dyn_ftrace *rec)
 	struct ftrace_ops *ops;
 	unsigned long addr;
 
+	/*
+	 * 4.19-research-fork: The mainline FL_DIRECT short-circuit returns
+	 * the direct trampoline address as the patch target, requiring a
+	 * bl reachable within ±128MB. On this build the BPF JIT region is
+	 * allocated via module_alloc which (with KASLR in this Lineage
+	 * config) lands several GB from kernel text — the bl can't reach
+	 * it. Instead, route through ops->trampoline (FTRACE_REGS_ADDR,
+	 * always in vmlinux text), and let the regs-caller's epilogue
+	 * read regs->orig_x0 (set by arch_ftrace_set_direct_caller) and
+	 * br to the BPF trampoline. This is the same effect as mainline's
+	 * direct path, just performed via the regs caller.
+	 */
 	if ((rec->flags & FTRACE_FL_DIRECT) &&
 	    (ftrace_rec_count(rec) == 1)) {
 		addr = find_rec_direct(rec->ip);
-		if (addr)
-			return addr;
-		WARN_ON_ONCE(1);
+		if (addr) {
+			long off = (long)addr - (long)rec->ip;
+			if (off >= -SZ_128M && off < SZ_128M)
+				return addr;
+			/* fall through to ops->trampoline routing */
+		} else {
+			WARN_ON_ONCE(1);
+		}
 	}
 
 	/* Trampolines take precedence over regs */
@@ -2518,12 +2575,17 @@ unsigned long ftrace_get_addr_curr(struct dyn_ftrace *rec)
 	struct ftrace_ops *ops;
 	unsigned long addr;
 
-	/* Direct calls take precedence over trampolines */
+	/* See ftrace_get_addr_new() for the rationale of this distance check. */
 	if (rec->flags & FTRACE_FL_DIRECT_EN) {
 		addr = find_rec_direct(rec->ip);
-		if (addr)
-			return addr;
-		WARN_ON_ONCE(1);
+		if (addr) {
+			long off = (long)addr - (long)rec->ip;
+			if (off >= -SZ_128M && off < SZ_128M)
+				return addr;
+			/* fall through to trampoline routing */
+		} else {
+			WARN_ON_ONCE(1);
+		}
 	}
 
 	/* Trampolines take precedence over regs */
@@ -5337,6 +5399,143 @@ int modify_ftrace_direct(unsigned long ip,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(modify_ftrace_direct);
+
+/*
+ * 4.19-research-fork: backport of mainline 5.18 commit f64dd4627ec6
+ * ("ftrace: Add multi direct register/unregister interface").
+ *
+ * Mainline-vs-this-tree adaptations:
+ *  - mainline calls ftrace_find_rec_direct(); we have find_rec_direct()
+ *    (same function, no `ftrace_` prefix).
+ *  - mainline uses register_ftrace_function_nolock(); we use the public
+ *    register_ftrace_function() which acquires only ftrace_lock — no
+ *    conflict with direct_mutex held here.
+ */
+
+#define MULTI_FLAGS (FTRACE_OPS_FL_IPMODIFY | FTRACE_OPS_FL_DIRECT | \
+		     FTRACE_OPS_FL_SAVE_REGS)
+
+static int check_direct_multi(struct ftrace_ops *ops)
+{
+	if (!(ops->flags & FTRACE_OPS_FL_INITIALIZED))
+		return -EINVAL;
+	if ((ops->flags & MULTI_FLAGS) != MULTI_FLAGS)
+		return -EINVAL;
+	return 0;
+}
+
+static void remove_direct_functions_hash(struct ftrace_hash *hash, unsigned long addr)
+{
+	struct ftrace_func_entry *entry, *del;
+	int size, i;
+
+	size = 1 << hash->size_bits;
+	for (i = 0; i < size; i++) {
+		hlist_for_each_entry(entry, &hash->buckets[i], hlist) {
+			del = __ftrace_lookup_ip(direct_functions, entry->ip);
+			if (del && del->direct == addr) {
+				remove_hash_entry(direct_functions, del);
+				kfree(del);
+			}
+		}
+	}
+}
+
+/**
+ * register_ftrace_direct_multi - Call a custom trampoline directly
+ * for multiple functions registered in @ops
+ * @ops: The address of the struct ftrace_ops object
+ * @addr: The address of the trampoline to call at @ops functions
+ *
+ * The patch site is routed through ftrace_regs_caller (== ops->trampoline);
+ * call_direct_funcs then arch_ftrace_set_direct_caller(regs, addr) to redirect
+ * the next jump to @addr without a ±128MB constraint on the bl.
+ */
+int register_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr)
+{
+	struct ftrace_hash *hash, *free_hash = NULL;
+	struct ftrace_func_entry *entry, *new;
+	int err = -EBUSY, size, i;
+
+	if (ops->func || ops->trampoline)
+		return -EINVAL;
+	if (!(ops->flags & FTRACE_OPS_FL_INITIALIZED))
+		return -EINVAL;
+	if (ops->flags & FTRACE_OPS_FL_ENABLED)
+		return -EINVAL;
+
+	hash = ops->func_hash->filter_hash;
+	if (ftrace_hash_empty(hash))
+		return -EINVAL;
+
+	mutex_lock(&direct_mutex);
+
+	/* Make sure requested entries are not already registered.. */
+	size = 1 << hash->size_bits;
+	for (i = 0; i < size; i++) {
+		hlist_for_each_entry(entry, &hash->buckets[i], hlist) {
+			if (find_rec_direct(entry->ip))
+				goto out_unlock;
+		}
+	}
+
+	/* ... and insert them to direct_functions hash. */
+	err = -ENOMEM;
+	for (i = 0; i < size; i++) {
+		hlist_for_each_entry(entry, &hash->buckets[i], hlist) {
+			new = ftrace_add_rec_direct(entry->ip, addr, &free_hash);
+			if (!new)
+				goto out_remove;
+			entry->direct = addr;
+		}
+	}
+
+	ops->func = call_direct_funcs;
+	ops->flags = MULTI_FLAGS;
+	ops->trampoline = FTRACE_REGS_ADDR;
+
+	err = register_ftrace_function(ops);
+
+ out_remove:
+	if (err)
+		remove_direct_functions_hash(hash, addr);
+
+ out_unlock:
+	mutex_unlock(&direct_mutex);
+
+	if (free_hash) {
+		synchronize_rcu_tasks();
+		free_ftrace_hash(free_hash);
+	}
+	return err;
+}
+EXPORT_SYMBOL_GPL(register_ftrace_direct_multi);
+
+/**
+ * unregister_ftrace_direct_multi - Remove calls to custom trampoline
+ * previously registered by register_ftrace_direct_multi for @ops object.
+ */
+int unregister_ftrace_direct_multi(struct ftrace_ops *ops, unsigned long addr)
+{
+	struct ftrace_hash *hash = ops->func_hash->filter_hash;
+	int err;
+
+	if (check_direct_multi(ops))
+		return -EINVAL;
+	if (!(ops->flags & FTRACE_OPS_FL_ENABLED))
+		return -EINVAL;
+
+	mutex_lock(&direct_mutex);
+	err = unregister_ftrace_function(ops);
+	remove_direct_functions_hash(hash, addr);
+	mutex_unlock(&direct_mutex);
+
+	/* cleanup for re-use */
+	ops->trampoline = 0;
+	ops->func = NULL;
+	return err;
+}
+EXPORT_SYMBOL_GPL(unregister_ftrace_direct_multi);
 #endif /* CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
 
 /**
