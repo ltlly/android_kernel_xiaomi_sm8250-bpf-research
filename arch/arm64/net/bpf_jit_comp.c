@@ -1029,7 +1029,6 @@ static void restore_args(struct jit_ctx *ctx, int args_off, int nargs)
 static void invoke_bpf_prog(struct jit_ctx *ctx, struct bpf_prog *p,
 			    int args_off, int retval_off, bool save_ret)
 {
-	__le32 *branch = NULL;
 	u64 enter_prog;
 	u64 exit_prog;
 
@@ -1041,16 +1040,18 @@ static void invoke_bpf_prog(struct jit_ctx *ctx, struct bpf_prog *p,
 		exit_prog = (u64)__bpf_prog_exit;
 	}
 
-	/* Call __bpf_prog_enter (no args). For non-sleepable, returns
-	 * u64 start time in x0; if start == 0, skip running the prog. */
+	/*
+	 * Call __bpf_prog_enter (no args). 4.19's non-sleepable variant
+	 * returns sched_clock() if stats are enabled, else 0 — NOT a "skip
+	 * recursion" signal (that semantics is upstream 6.x). So we always
+	 * call bpf_func regardless of the return value, and pass it
+	 * unchanged to __bpf_prog_exit as start-time.
+	 */
 	emit_call(enter_prog, ctx);
 
 	if (!p->aux->sleepable) {
-		/* save start time to callee-saved x20 */
+		/* save start time to callee-saved x20 for __bpf_prog_exit */
 		emit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);
-		/* if (start == 0) goto skip_exec  -- NOP patched to CBZ later */
-		branch = ctx->image + ctx->idx;
-		emit(A64_NOP, ctx);
 	}
 
 	/* Call BPF program: arg1 = pointer to saved args on stack */
@@ -1061,12 +1062,6 @@ static void invoke_bpf_prog(struct jit_ctx *ctx, struct bpf_prog *p,
 
 	if (save_ret)
 		emit(A64_STR64I(A64_R(0), A64_SP, retval_off), ctx);
-
-	/* Patch the skip-exec branch to CBZ x20, <to_here> */
-	if (!p->aux->sleepable && ctx->image && branch) {
-		int offset = &ctx->image[ctx->idx] - branch;
-		*branch = cpu_to_le32(A64_CBZ(1, A64_R(20), offset));
-	}
 
 	/* Call __bpf_prog_exit. Non-sleepable takes (prog, start). */
 	if (!p->aux->sleepable) {
