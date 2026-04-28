@@ -13,8 +13,18 @@
 
 #include <asm/insn.h>
 
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+#define ARCH_SUPPORTS_FTRACE_OPS 1
+#else
 #define MCOUNT_ADDR		((unsigned long)_mcount)
+#endif
+
+/* The BL at the callsite's adjusted rec->ip */
 #define MCOUNT_INSN_SIZE	AARCH64_INSN_SIZE
+
+#define FTRACE_PLT_IDX		0
+#define FTRACE_REGS_PLT_IDX	1
+#define NR_FTRACE_PLTS		2
 
 #ifndef __ASSEMBLY__
 #include <linux/compat.h>
@@ -33,11 +43,36 @@ extern void return_to_handler(void);
 static inline unsigned long ftrace_call_adjust(unsigned long addr)
 {
 	/*
+	 * Adjust addr to point at the BL in the callsite.
+	 * See ftrace_init_nop() for the callsite sequence.
+	 */
+	if (IS_ENABLED(CONFIG_DYNAMIC_FTRACE_WITH_REGS))
+		return addr + AARCH64_INSN_SIZE;
+	/*
 	 * addr is the address of the mcount call instruction.
 	 * recordmcount does the necessary offset calculation.
 	 */
 	return addr;
 }
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_REGS
+struct dyn_ftrace;
+int ftrace_init_nop(struct module *mod, struct dyn_ftrace *rec);
+#define ftrace_init_nop ftrace_init_nop
+#endif
+
+#ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+/*
+ * Hand back to ftrace_regs_caller's epilogue, which restores pc=regs->pc and
+ * `ret`s into it. By overwriting pc with the direct caller address we route
+ * the next jump straight to the BPF trampoline.
+ */
+static inline void arch_ftrace_set_direct_caller(struct pt_regs *regs,
+						 unsigned long addr)
+{
+	regs->pc = addr;
+}
+#endif
 
 #define ftrace_return_address(n) return_address(n)
 
