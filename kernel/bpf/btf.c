@@ -13,6 +13,8 @@
 #include <linux/slab.h>
 #include <linux/anon_inodes.h>
 #include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/vmalloc.h>
 #include <linux/uaccess.h>
 #include <linux/kernel.h>
 #include <linux/idr.h>
@@ -4325,8 +4327,19 @@ static int btf_vmlinux_map_ids_init(const struct btf *btf,
 		}
 		btf_id = btf_find_by_name_kind(btf, ops->map_btf_name,
 					       BTF_KIND_STRUCT);
-		if (btf_id < 0)
-			return btf_id;
+		if (btf_id < 0) {
+			/* 4.19-research-fork: pahole's BTF generator may strip
+			 * file-static structs (e.g. bpf_shtab in sock_map.c)
+			 * that aren't referenced from any global. Without the
+			 * struct in BTF we can't set map_btf_id, but that only
+			 * disables map_ptr_access for THIS map type — the BPF
+			 * tracing/lsm/ext prog types still work. Don't fail
+			 * the whole init; just skip this entry.
+			 */
+			pr_info("btf: map_btf_name '%s' not in BTF (idx=%d) — map_ptr access disabled for this map type\n",
+				ops->map_btf_name, i);
+			continue;
+		}
 		*ops->map_btf_id = btf_id;
 	}
 
@@ -4350,6 +4363,50 @@ static int btf_translate_to_vmlinux(struct bpf_verifier_log *log,
 
 BTF_ID_LIST(bpf_ctx_convert_btf_id)
 BTF_ID(struct, bpf_ctx_convert)
+
+/*
+ * 4.19-research-fork: alioth bootloader rejects kernel Image >~64MB, so we
+ * cannot ship the .BTF section in vmlinux. Instead, load BTF from a known
+ * filesystem path on first verifier use. /vendor/firmware/ is mounted early
+ * on Android Q+, well before any BPF tracing program would attempt to load.
+ *
+ * Search order — first existing file wins:
+ *   1. /vendor/firmware/vmlinux.btf      (preferred — Android firmware path)
+ *   2. /lib/firmware/vmlinux.btf         (standard Linux firmware path)
+ *   3. /data/local/tmp/vmlinux.btf       (research/dev override)
+ */
+static const char * const ksu_btf_search_paths[] = {
+	"/vendor/firmware/vmlinux.btf",
+	"/lib/firmware/vmlinux.btf",
+	"/data/local/tmp/vmlinux.btf",
+	NULL,
+};
+
+static int ksu_btf_load_from_fs(void **buf_out, u32 *size_out)
+{
+	const char * const *p;
+	void *buf = NULL;
+	loff_t size = 0;
+	int err = -ENOENT;
+
+	for (p = ksu_btf_search_paths; *p; p++) {
+		err = kernel_read_file_from_path(*p, &buf, &size, 0,
+						 READING_FIRMWARE);
+		if (err == 0 && buf && size > 0) {
+			pr_info("btf: loaded vmlinux BTF from %s (%lld bytes)\n",
+				*p, (long long)size);
+			*buf_out = buf;
+			*size_out = (u32)size;
+			return 0;
+		}
+		if (buf) {
+			vfree(buf);
+			buf = NULL;
+		}
+	}
+	pr_warn("btf: no in-kernel .BTF section and no BTF file found in any of the search paths\n");
+	return err;
+}
 
 struct btf *btf_parse_vmlinux(void)
 {
@@ -4375,29 +4432,49 @@ struct btf *btf_parse_vmlinux(void)
 	btf->data = __start_BTF;
 	btf->data_size = __stop_BTF - __start_BTF;
 
+	/* Fallback to filesystem when CONFIG_DEBUG_INFO_BTF=n made the
+	 * .BTF section empty. btf->data is freed by btf_free() via kvfree(),
+	 * which dispatches to vfree() for vmalloc'd buffers — so the buffer
+	 * returned by kernel_read_file_from_path() is freed correctly.
+	 */
+	if (btf->data_size == 0) {
+		err = ksu_btf_load_from_fs(&btf->data, &btf->data_size);
+		if (err)
+			goto errout;
+	}
+
 	err = btf_parse_hdr(env);
-	if (err)
+	if (err) {
+		pr_warn("btf: btf_parse_hdr failed err=%d\n", err);
 		goto errout;
+	}
 
 	btf->nohdr_data = btf->data + btf->hdr.hdr_len;
 
 	err = btf_parse_str_sec(env);
-	if (err)
+	if (err) {
+		pr_warn("btf: btf_parse_str_sec failed err=%d\n", err);
 		goto errout;
+	}
 
 	err = btf_check_all_metas(env);
-	if (err)
+	if (err) {
+		pr_warn("btf: btf_check_all_metas failed err=%d\n", err);
 		goto errout;
+	}
 
 	/* btf_parse_vmlinux() runs under bpf_verifier_lock */
 	bpf_ctx_convert.t = btf_type_by_id(btf, bpf_ctx_convert_btf_id[0]);
 
 	/* find bpf map structs for map_ptr access checking */
 	err = btf_vmlinux_map_ids_init(btf, log);
-	if (err < 0)
+	if (err < 0) {
+		pr_warn("btf: btf_vmlinux_map_ids_init failed err=%d\n", err);
 		goto errout;
+	}
 
 	bpf_struct_ops_init(btf, log);
+	pr_info("btf: btf_parse_vmlinux SUCCESS, %u types\n", btf->nr_types);
 
 	btf_verifier_env_free(env);
 	refcount_set(&btf->refcnt, 1);
@@ -4407,6 +4484,13 @@ errout:
 	btf_verifier_env_free(env);
 	if (btf) {
 		kvfree(btf->types);
+		/* 4.19-research-fork: when ksu_btf_load_from_fs() succeeded but
+		 * a later parse step failed, btf->data points to a vmalloc'd
+		 * buffer (not the kernel's __start_BTF section) and must be
+		 * freed here to avoid leaking ~10MB per failed parse.
+		 */
+		if (btf->data && btf->data != __start_BTF)
+			vfree(btf->data);
 		kfree(btf);
 	}
 	return ERR_PTR(err);

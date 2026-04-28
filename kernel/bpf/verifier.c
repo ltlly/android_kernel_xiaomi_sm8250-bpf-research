@@ -12557,12 +12557,34 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	return 0;
 }
 
+/* 4.19-research-fork: rate-limit BTF parse failure retries.
+ * Keep btf_vmlinux always NULL or a valid pointer (never ERR_PTR) so callers
+ * that dereference it directly don't oops. To avoid spinning on a broken BTF
+ * file, skip retry attempts until at least 5 seconds have passed since the
+ * last failure.
+ */
+static unsigned long ksu_btf_last_fail_jiffies;
+#define KSU_BTF_FAIL_RETRY_DELAY (5 * HZ)
+
 struct btf *bpf_get_btf_vmlinux(void)
 {
-	if (!btf_vmlinux && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) {
+	if (!btf_vmlinux) {
+		struct btf *parsed;
+		unsigned long now = jiffies;
+
+		if (ksu_btf_last_fail_jiffies &&
+		    time_before(now, ksu_btf_last_fail_jiffies +
+				     KSU_BTF_FAIL_RETRY_DELAY))
+			return NULL;
+
 		mutex_lock(&bpf_verifier_lock);
-		if (!btf_vmlinux)
-			btf_vmlinux = btf_parse_vmlinux();
+		if (!btf_vmlinux) {
+			parsed = btf_parse_vmlinux();
+			if (!IS_ERR(parsed))
+				btf_vmlinux = parsed;
+			else
+				ksu_btf_last_fail_jiffies = jiffies;
+		}
 		mutex_unlock(&bpf_verifier_lock);
 	}
 	return btf_vmlinux;
