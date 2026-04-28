@@ -265,10 +265,10 @@ static int unregister_fentry(struct bpf_trampoline *tr, void *old_addr)
 	int ret;
 
 	if (tr->func.ftrace_managed) {
-		ret = unregister_ftrace_direct((long)ip, (long)old_addr);
-		/* fall back to our adapter unregister */
-		if (ret == -ENOTSUPP || ret == -ENOENT)
-			ret = ksu_unregister_ftrace_adapter(ip);
+		/* register_fentry didn't go through register_ftrace_direct on
+		 * this branch (see comment there), so unregister symmetrically
+		 * via our adapter. */
+		ret = ksu_unregister_ftrace_adapter(ip);
 	} else {
 		ret = bpf_arch_text_poke(ip, BPF_MOD_CALL, old_addr, NULL);
 	}
@@ -281,12 +281,12 @@ static int modify_fentry(struct bpf_trampoline *tr, void *old_addr, void *new_ad
 	int ret;
 
 	if (tr->func.ftrace_managed) {
-		ret = modify_ftrace_direct((long)ip, (long)old_addr, (long)new_addr);
 		/* The adapter dispatches to tr->progs_hlist directly, so any
-		 * "modify" by the trampoline core is a no-op for us — the new
-		 * BPF prog list is already visible via the same trampoline. */
-		if (ret == -ENOTSUPP)
-			ret = 0;
+		 * trampoline image swap is a no-op for us — new BPF progs are
+		 * already visible via the same adapter ftrace_ops. Skip
+		 * modify_ftrace_direct (it would fail with -EINVAL via the
+		 * ftrace_kill path described in register_fentry). */
+		ret = 0;
 	} else {
 		ret = bpf_arch_text_poke(ip, BPF_MOD_CALL, old_addr, new_addr);
 	}
@@ -305,11 +305,33 @@ static int register_fentry(struct bpf_trampoline *tr, void *new_addr)
 		tr->func.ftrace_managed = true;
 
 	if (tr->func.ftrace_managed) {
-		ret = register_ftrace_direct((long)ip, (long)new_addr);
-		/* 4.19 arm64 fallback path: register an ftrace_ops that
-		 * dispatches to BPF programs from C. */
-		if (ret == -ENOTSUPP)
-			ret = ksu_register_ftrace_adapter(tr, ip);
+		/*
+		 * Skip register_ftrace_direct on this branch. The 4.19-cip
+		 * single-API register_ftrace_direct asks ftrace to patch the
+		 * call site to `bl <BPF_trampoline>` directly. The BPF
+		 * trampoline is allocated via module_alloc and is often more
+		 * than ±128MB from a vmlinux-text call site, so the patch
+		 * fails with -EINVAL. ftrace_bug then runs FTRACE_WARN_ON_ONCE
+		 * which calls ftrace_kill(), permanently disabling ftrace —
+		 * fatal for the rest of the system. Mainline 5.18+ avoids
+		 * this with register_ftrace_direct_multi, which sets
+		 * ops->trampoline=ftrace_regs_caller and reaches the BPF
+		 * trampoline through pt_regs->pc redirection inside
+		 * call_direct_funcs (no ±128MB constraint on that hop).
+		 *
+		 * On this branch we use a structurally equivalent route via
+		 * ksu_register_ftrace_adapter: a per-ip ftrace_ops with
+		 * FL_SAVE_REGS whose ->func dispatches to the BPF programs.
+		 * With the 5.5 patchable-fentry backport, ftrace_regs_caller
+		 * saves pt_regs *before* the function prologue, so
+		 * regs->regs[0..7] are the original function arguments —
+		 * exactly what BPF fentry programs expect for ctx[0..7].
+		 *
+		 * Caveat: this path supports fentry only. fexit / fmod_ret /
+		 * return-value capture would need register_ftrace_direct_multi
+		 * proper, which is a separate backport.
+		 */
+		ret = ksu_register_ftrace_adapter(tr, ip);
 	} else {
 		ret = bpf_arch_text_poke(ip, BPF_MOD_CALL, NULL, new_addr);
 	}
