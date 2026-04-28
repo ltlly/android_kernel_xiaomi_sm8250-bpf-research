@@ -69,6 +69,13 @@
 	/* Save the PC after the ftrace callsite */
 	str	x30, [sp, #S_PC]
 
+	/*
+	 * Zero S_ORIG_X0 — used by arch_ftrace_set_direct_caller as a
+	 * "redirect to BPF trampoline" flag. Must start at 0 so the
+	 * non-redirect path stays on the normal return.
+	 */
+	str	xzr, [sp, #S_ORIG_X0]
+
 	/* Create a frame record for the callsite above pt_regs */
 	stp	x29, x9, [sp, #S_FRAME_SIZE]
 	add	x29, sp, #S_FRAME_SIZE
@@ -111,6 +118,15 @@ ftrace_graph_call:				// ftrace_graph_caller();
  * to restore x0-x8, x29, and x30.
  */
 ftrace_common_return:
+	/*
+	 * arch_ftrace_set_direct_caller() may have stashed a direct trampoline
+	 * address in S_ORIG_X0. If non-zero, set up the BPF trampoline's
+	 * expected entry ABI (x9=parent_lr, lr=sym+8, x0..x7=args) and br to
+	 * it. Otherwise fall through to the normal return path.
+	 */
+	ldr	x10, [sp, #S_ORIG_X0]
+	cbnz	x10, ftrace_common_redirect_direct
+
 	/* Restore function arguments */
 	ldp	x0, x1, [sp]
 	ldp	x2, x3, [sp, #S_X2]
@@ -127,6 +143,29 @@ ftrace_common_return:
 	add	sp, sp, #S_FRAME_SIZE + 16
 
 	ret	x9
+
+ftrace_common_redirect_direct:
+	/* Restore function args (x0..x7 hold the original argument regs). */
+	ldp	x0, x1, [sp]
+	ldp	x2, x3, [sp, #S_X2]
+	ldp	x4, x5, [sp, #S_X4]
+	ldp	x6, x7, [sp, #S_X6]
+	ldr	x8, [sp, #S_X8]
+
+	/*
+	 * BPF trampoline ABI (matches arch_prepare_bpf_trampoline JIT in
+	 * arch/arm64/net/bpf_jit_comp.c): x9 = parent's lr (the value MOV
+	 * X9, LR captured before our BL), x30 = retaddr after BL (= sym+8,
+	 * used by JIT as orig_call retaddr), x10 = direct trampoline addr.
+	 */
+	ldr	x29, [sp, #S_FP]
+	ldr	x9,  [sp, #S_LR]	/* parent's lr */
+	ldr	x30, [sp, #S_PC]	/* sym+8 */
+
+	/* Restore the callsite's SP and free our frame */
+	add	sp, sp, #S_FRAME_SIZE + 16
+
+	br	x10
 ENDPROC(ftrace_common)
 
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER

@@ -63,14 +63,26 @@ int ftrace_init_nop(struct module *mod, struct dyn_ftrace *rec);
 
 #ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
 /*
- * Hand back to ftrace_regs_caller's epilogue, which restores pc=regs->pc and
- * `ret`s into it. By overwriting pc with the direct caller address we route
- * the next jump straight to the BPF trampoline.
+ * Stash the direct trampoline address in pt_regs->orig_x0 — an unused slot
+ * on the ftrace path. ftrace_common_return inspects this slot and, when
+ * non-zero, restores the BPF trampoline's expected entry ABI before
+ * branching there:
+ *
+ *   x9       = parent's lr (saved at S_LR)         <- BPF frame record
+ *   x30 (lr) = address after the BL (saved at S_PC) <- becomes retaddr_off
+ *              inside the BPF trampoline; used as `bl orig` to re-enter the
+ *              instrumented function body past the patched 2-NOP slot.
+ *   x0..x7   = original function arguments (saved at S_X0..S_X7)
+ *   br x10   = jump to BPF trampoline (orig_x0)
+ *
+ * This mirrors mainline 5.18 register_ftrace_direct_multi's path
+ * (call_direct_funcs -> arch_ftrace_set_direct_caller) without needing
+ * a `ftrace_regs` extension struct.
  */
 static inline void arch_ftrace_set_direct_caller(struct pt_regs *regs,
 						 unsigned long addr)
 {
-	regs->pc = addr;
+	regs->orig_x0 = addr;
 }
 #endif
 
