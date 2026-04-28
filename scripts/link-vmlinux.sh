@@ -433,7 +433,7 @@ vmlinux_link vmlinux "${kallsymso}" "${btf_vmlinux_bin_o}"
 # fill in BTF IDs
 if [ -n "${CONFIG_DEBUG_INFO_BTF}" ]; then
 info BTFIDS vmlinux
-${RESOLVE_BTFIDS} vmlinux
+if [ -x "${RESOLVE_BTFIDS}" ]; then ${RESOLVE_BTFIDS} vmlinux; else info "BTFIDS" "skipping (resolve_btfids not present in 4.19)"; fi
 fi
 
 if [ -n "${CONFIG_BUILDTIME_EXTABLE_SORT}" ]; then
