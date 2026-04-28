@@ -22,6 +22,9 @@
 #include <linux/filter.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/memory.h>		/* text_mutex for arm64 trampoline backport */
+#include <linux/sizes.h>		/* SZ_128M */
+#include <asm/cacheflush.h>		/* flush_icache_range */
 
 #include <asm/byteorder.h>
 #include <asm/cacheflush.h>
@@ -978,4 +981,348 @@ void *bpf_jit_alloc_exec(unsigned long size)
 void bpf_jit_free_exec(void *addr)
 {
 	return vfree(addr);
+}
+
+/* ============================================================
+ * 4.19-research-fork: arm64 BPF trampoline backport
+ *
+ * Backport of upstream Linux 6.0+ arm64 BPF trampoline emitter (commit
+ * efc9909fdce0). Enables fentry/fexit/lsm/ext BPF program attachment to
+ * kernel functions on 4.19-cip arm64.
+ *
+ * Adapted from upstream 6.0:
+ *   - 4.19's bpf_tramp_progs (with progs[]/nr_progs) instead of bpf_tramp_links
+ *   - 4.19's __bpf_prog_enter() returns u64 with no args; no run_ctx
+ *   - No PLT/long-jump support (trampoline must be within ±128MB of target)
+ *   - No BTI emit (kernel typically not built with CONFIG_ARM64_BTI_KERNEL)
+ *   - No fmod_ret / BPF_TRAMP_F_IP_ARG support (V1)
+ * ============================================================ */
+
+static inline void emit_call(u64 target, struct jit_ctx *ctx)
+{
+	u8 tmp = bpf2a64[TMP_REG_1];
+
+	emit_addr_mov_i64(tmp, target, ctx);
+	emit(A64_BLR(tmp), ctx);
+}
+
+static void save_args(struct jit_ctx *ctx, int args_off, int nargs)
+{
+	int i;
+
+	for (i = 0; i < nargs; i++) {
+		emit(A64_STR64I(i, A64_SP, args_off), ctx);
+		args_off += 8;
+	}
+}
+
+static void restore_args(struct jit_ctx *ctx, int args_off, int nargs)
+{
+	int i;
+
+	for (i = 0; i < nargs; i++) {
+		emit(A64_LDR64I(i, A64_SP, args_off), ctx);
+		args_off += 8;
+	}
+}
+
+static void invoke_bpf_prog(struct jit_ctx *ctx, struct bpf_prog *p,
+			    int args_off, int retval_off, bool save_ret)
+{
+	__le32 *branch = NULL;
+	u64 enter_prog;
+	u64 exit_prog;
+
+	if (p->aux->sleepable) {
+		enter_prog = (u64)__bpf_prog_enter_sleepable;
+		exit_prog = (u64)__bpf_prog_exit_sleepable;
+	} else {
+		enter_prog = (u64)__bpf_prog_enter;
+		exit_prog = (u64)__bpf_prog_exit;
+	}
+
+	/* Call __bpf_prog_enter (no args). For non-sleepable, returns
+	 * u64 start time in x0; if start == 0, skip running the prog. */
+	emit_call(enter_prog, ctx);
+
+	if (!p->aux->sleepable) {
+		/* save start time to callee-saved x20 */
+		emit(A64_MOV(1, A64_R(20), A64_R(0)), ctx);
+		/* if (start == 0) goto skip_exec  -- NOP patched to CBZ later */
+		branch = ctx->image + ctx->idx;
+		emit(A64_NOP, ctx);
+	}
+
+	/* Call BPF program: arg1 = pointer to saved args on stack */
+	emit(A64_ADD_I(1, A64_R(0), A64_SP, args_off), ctx);
+	if (!p->jited)
+		emit_addr_mov_i64(A64_R(1), (const u64)p->insnsi, ctx);
+	emit_call((const u64)p->bpf_func, ctx);
+
+	if (save_ret)
+		emit(A64_STR64I(A64_R(0), A64_SP, retval_off), ctx);
+
+	/* Patch the skip-exec branch to CBZ x20, <to_here> */
+	if (!p->aux->sleepable && ctx->image && branch) {
+		int offset = &ctx->image[ctx->idx] - branch;
+		*branch = cpu_to_le32(A64_CBZ(1, A64_R(20), offset));
+	}
+
+	/* Call __bpf_prog_exit. Non-sleepable takes (prog, start). */
+	if (!p->aux->sleepable) {
+		emit_addr_mov_i64(A64_R(0), (const u64)p, ctx);
+		emit(A64_MOV(1, A64_R(1), A64_R(20)), ctx);
+	}
+	emit_call(exit_prog, ctx);
+}
+
+/* Emit the full trampoline body. Returns instruction count, or negative err. */
+static int prepare_trampoline(struct jit_ctx *ctx, struct bpf_tramp_image *im,
+			      struct bpf_tramp_progs *tprogs, void *orig_call,
+			      int nargs, u32 flags)
+{
+	int i;
+	int stack_size;
+	int retaddr_off;
+	int regs_off;
+	int retval_off;
+	int args_off;
+	int nargs_off;
+	struct bpf_tramp_progs *fentry = &tprogs[BPF_TRAMP_FENTRY];
+	struct bpf_tramp_progs *fexit = &tprogs[BPF_TRAMP_FEXIT];
+	bool save_ret;
+
+	/*
+	 * Trampoline stack layout (grows toward lower addresses):
+	 *
+	 *                  [ parent ip       ]   <- from x9 at entry
+	 *                  [ FP (parent)     ]
+	 * SP + retaddr_off [ self ip / LR    ]
+	 *                  [ FP              ]
+	 *                  [ padding (align) ]
+	 *                  [ x20 saved       ]
+	 * SP + regs_off    [ x19 saved       ]
+	 * SP + retval_off  [ ret value       ]   if save_ret
+	 *                  [ argN            ]
+	 *                  [ ...             ]
+	 * SP + args_off    [ arg1            ]
+	 * SP + nargs_off   [ args count      ]
+	 * SP                                  <-- after sub stack_size
+	 */
+	stack_size = 0;
+
+	nargs_off = stack_size;
+	stack_size += 8;
+
+	args_off = stack_size;
+	stack_size += nargs * 8;
+
+	retval_off = stack_size;
+	save_ret = flags & (BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_RET_FENTRY_RET);
+	if (save_ret)
+		stack_size += 8;
+
+	regs_off = stack_size;
+	stack_size += 16;	/* x19, x20 */
+
+	stack_size = round_up(stack_size, 16);
+	retaddr_off = stack_size + 8;
+
+	/* Frame for parent function: push parent FP and parent LR (in x9) */
+	emit(A64_PUSH(A64_FP, A64_R(9), A64_SP), ctx);
+	emit(A64_MOV(1, A64_FP, A64_SP), ctx);
+
+	/* Frame for patched function: push current FP and LR */
+	emit(A64_PUSH(A64_FP, A64_LR, A64_SP), ctx);
+	emit(A64_MOV(1, A64_FP, A64_SP), ctx);
+
+	/* Allocate stack space */
+	emit(A64_SUB_I(1, A64_SP, A64_SP, stack_size), ctx);
+
+	/* Save args count */
+	emit(A64_MOVZ(1, A64_R(10), nargs, 0), ctx);
+	emit(A64_STR64I(A64_R(10), A64_SP, nargs_off), ctx);
+
+	/* Save argument registers x0..x[nargs-1] */
+	save_args(ctx, args_off, nargs);
+
+	/* Save callee-saved x19, x20 */
+	emit(A64_STR64I(A64_R(19), A64_SP, regs_off), ctx);
+	emit(A64_STR64I(A64_R(20), A64_SP, regs_off + 8), ctx);
+
+	if (flags & BPF_TRAMP_F_CALL_ORIG) {
+		emit_addr_mov_i64(A64_R(0), (const u64)im, ctx);
+		emit_call((const u64)__bpf_tramp_enter, ctx);
+	}
+
+	/* Run all fentry programs */
+	for (i = 0; i < fentry->nr_progs; i++)
+		invoke_bpf_prog(ctx, fentry->progs[i], args_off, retval_off,
+				flags & BPF_TRAMP_F_RET_FENTRY_RET);
+
+	if (flags & BPF_TRAMP_F_CALL_ORIG) {
+		/* Restore args x0..xN */
+		restore_args(ctx, args_off, nargs);
+		/* Call original function (its address is at retaddr_off) */
+		emit(A64_LDR64I(A64_R(10), A64_SP, retaddr_off), ctx);
+		emit(A64_BLR(A64_R(10)), ctx);
+		/* Save return value */
+		emit(A64_STR64I(A64_R(0), A64_SP, retval_off), ctx);
+		/* Reserve a slot for fmod_ret use (we don't support it but
+		 * keep the symbol for upstream ABI compat) */
+		im->ip_after_call = ctx->image + ctx->idx;
+		emit(A64_NOP, ctx);
+	}
+
+	/* Run all fexit programs */
+	for (i = 0; i < fexit->nr_progs; i++)
+		invoke_bpf_prog(ctx, fexit->progs[i], args_off, retval_off,
+				false);
+
+	if (flags & BPF_TRAMP_F_CALL_ORIG) {
+		im->ip_epilogue = ctx->image + ctx->idx;
+		emit_addr_mov_i64(A64_R(0), (const u64)im, ctx);
+		emit_call((const u64)__bpf_tramp_exit, ctx);
+	}
+
+	if (flags & BPF_TRAMP_F_RESTORE_REGS)
+		restore_args(ctx, args_off, nargs);
+
+	/* Restore callee-saved x19, x20 */
+	emit(A64_LDR64I(A64_R(19), A64_SP, regs_off), ctx);
+	emit(A64_LDR64I(A64_R(20), A64_SP, regs_off + 8), ctx);
+
+	if (save_ret)
+		emit(A64_LDR64I(A64_R(0), A64_SP, retval_off), ctx);
+
+	/* Reset SP to FP */
+	emit(A64_MOV(1, A64_SP, A64_FP), ctx);
+
+	/* Pop both frames */
+	emit(A64_POP(A64_FP, A64_LR, A64_SP), ctx);
+	emit(A64_POP(A64_FP, A64_R(9), A64_SP), ctx);
+
+	if (flags & BPF_TRAMP_F_SKIP_FRAME) {
+		/* Skip patched function, return directly to parent */
+		emit(A64_MOV(1, A64_LR, A64_R(9)), ctx);
+		emit(A64_RET(A64_R(9)), ctx);
+	} else {
+		/* Return to patched function (LR was restored by POP) */
+		emit(A64_MOV(1, A64_R(10), A64_LR), ctx);
+		emit(A64_MOV(1, A64_LR, A64_R(9)), ctx);
+		emit(A64_RET(A64_R(10)), ctx);
+	}
+
+	if (ctx->image)
+		bpf_flush_icache(ctx->image, ctx->image + ctx->idx);
+
+	return ctx->idx;
+}
+
+int arch_prepare_bpf_trampoline(struct bpf_tramp_image *im, void *image,
+				void *image_end,
+				const struct btf_func_model *m, u32 flags,
+				struct bpf_tramp_progs *tprogs,
+				void *orig_call)
+{
+	int ret;
+	int nargs = m->nr_args;
+	int max_insns = ((long)image_end - (long)image) / AARCH64_INSN_SIZE;
+	struct jit_ctx ctx = {
+		.image = NULL,
+		.idx = 0,
+	};
+
+	/* Only the first 8 args are passed by registers (arm64 AAPCS) */
+	if (nargs > 8)
+		return -ENOTSUPP;
+
+	/* fmod_ret unsupported in this V1 backport */
+	if (tprogs[BPF_TRAMP_MODIFY_RETURN].nr_progs)
+		return -ENOTSUPP;
+
+	/* First pass: compute size */
+	ret = prepare_trampoline(&ctx, im, tprogs, orig_call, nargs, flags);
+	if (ret < 0)
+		return ret;
+
+	if (ret > max_insns)
+		return -EFBIG;
+
+	/* Second pass: actually emit code */
+	ctx.image = image;
+	ctx.idx = 0;
+
+	jit_fill_hole(image, (unsigned int)(image_end - image));
+	ret = prepare_trampoline(&ctx, im, tprogs, orig_call, nargs, flags);
+
+	if (ret > 0 && validate_code(&ctx) < 0)
+		ret = -EINVAL;
+
+	if (ret > 0)
+		ret *= AARCH64_INSN_SIZE;
+
+	return ret;
+}
+
+/* ----- bpf_arch_text_poke: live-patch nop ↔ bl at function entry ----- */
+
+static bool is_long_jump(void *ip, void *target)
+{
+	long offset;
+
+	if (!target)
+		return false;
+	offset = (long)target - (long)ip;
+	/* arm64 bl/b range is ±128MB */
+	return offset < -SZ_128M || offset >= SZ_128M;
+}
+
+static int gen_branch_or_nop(enum aarch64_insn_branch_type type, void *ip,
+			     void *addr, u32 *insn)
+{
+	if (!addr) {
+		*insn = aarch64_insn_gen_nop();
+		return 0;
+	}
+
+	/* No PLT support — caller's trampoline must be within ±128MB of ip.
+	 * vmalloc'd BPF trampoline lives in module space which is <128MB
+	 * from kernel text on 4.19 arm64. */
+	if (is_long_jump(ip, addr))
+		return -EFAULT;
+
+	*insn = aarch64_insn_gen_branch_imm((unsigned long)ip,
+					    (unsigned long)addr, type);
+
+	return *insn != AARCH64_BREAK_FAULT ? 0 : -EFAULT;
+}
+
+int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type poke_type,
+		       void *old_addr, void *new_addr)
+{
+	u32 old_insn, new_insn;
+	enum aarch64_insn_branch_type btype;
+	int ret;
+
+	btype = (poke_type == BPF_MOD_CALL) ?
+		AARCH64_INSN_BRANCH_LINK : AARCH64_INSN_BRANCH_NOLINK;
+
+	if (gen_branch_or_nop(btype, ip, old_addr, &old_insn) < 0)
+		return -EFAULT;
+	if (gen_branch_or_nop(btype, ip, new_addr, &new_insn) < 0)
+		return -EFAULT;
+
+	if (old_insn == new_insn)
+		return 0;
+
+	mutex_lock(&text_mutex);
+	if (le32_to_cpu(*(__le32 *)ip) != old_insn) {
+		ret = -EFAULT;
+		goto out;
+	}
+	ret = aarch64_insn_patch_text_nosync(ip, new_insn);
+out:
+	mutex_unlock(&text_mutex);
+	return ret;
 }
