@@ -633,6 +633,12 @@ struct bpf_trampoline {
 	/* Executable image of trampoline */
 	struct bpf_tramp_image *cur_image;
 	u64 selector;
+	/*
+	 * Per-trampoline ftrace_ops used by register_ftrace_direct_multi.
+	 * Allocated lazily on first ftrace-managed registration. Mainline
+	 * 6.0 puts this in struct bpf_trampoline; we mirror the layout.
+	 */
+	struct ftrace_ops *fops;
 };
 
 struct bpf_attach_target_info {
