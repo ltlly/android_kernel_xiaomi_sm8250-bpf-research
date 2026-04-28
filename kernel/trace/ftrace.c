@@ -2676,14 +2676,14 @@ struct dyn_ftrace *ftrace_rec_iter_record(struct ftrace_rec_iter *iter)
 }
 
 static int
-ftrace_code_disable(struct module *mod, struct dyn_ftrace *rec)
+ftrace_nop_initialize(struct module *mod, struct dyn_ftrace *rec)
 {
 	int ret;
 
 	if (unlikely(ftrace_disabled))
 		return 0;
 
-	ret = ftrace_make_nop(mod, rec, MCOUNT_ADDR);
+	ret = ftrace_init_nop(mod, rec);
 	if (ret) {
 		ftrace_bug_type = FTRACE_BUG_INIT;
 		ftrace_bug(ret, rec);
@@ -3133,7 +3133,7 @@ static int ftrace_update_code(struct module *mod, struct ftrace_page *new_pgs)
 			 * to the NOP instructions.
 			 */
 			if (!__is_defined(CC_USING_NOP_MCOUNT) &&
-			    !ftrace_code_disable(mod, p))
+			    !ftrace_nop_initialize(mod, p))
 				break;
 
 			update_cnt++;
@@ -5073,7 +5073,8 @@ int register_ftrace_direct(unsigned long ip, unsigned long addr)
 		if (size < 32)
 			size = 32;
 
-		new_hash = dup_hash(direct_functions, size);
+		new_hash = alloc_and_copy_ftrace_hash(
+				fls(size > 1 ? size - 1 : 1), direct_functions);
 		if (!new_hash)
 			goto out_unlock;
 
@@ -5141,7 +5142,6 @@ static struct ftrace_func_entry *find_direct_entry(unsigned long *ip,
 						   struct dyn_ftrace **recp)
 {
 	struct ftrace_func_entry *entry;
-	struct ftrace_direct_func *direct;
 	struct dyn_ftrace *rec;
 
 	rec = lookup_rec(*ip, *ip);
