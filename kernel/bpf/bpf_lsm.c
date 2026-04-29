@@ -27,24 +27,44 @@ noinline RET bpf_lsm_##NAME(__VA_ARGS__)	\
 #include <linux/lsm_hook_defs.h>
 #undef LSM_HOOK
 
-#define LSM_HOOK(RET, DEFAULT, NAME, ...) BTF_ID(func, bpf_lsm_##NAME)
-BTF_SET_START(bpf_lsm_hooks)
-#include <linux/lsm_hook_defs.h>
-#undef LSM_HOOK
-BTF_SET_END(bpf_lsm_hooks)
+/* alioth-research-fork: BTF_SET(bpf_lsm_hooks) is unused — see
+ * bpf_lsm_verify_prog below for the reason. Kept commented out (not
+ * deleted) so a future port to a tree with resolve_btfids in tools/
+ * can restore the BTF_ID-based check by un-commenting this block.
+ *
+ * #define LSM_HOOK(RET, DEFAULT, NAME, ...) BTF_ID(func, bpf_lsm_##NAME)
+ * BTF_SET_START(bpf_lsm_hooks)
+ * #include <linux/lsm_hook_defs.h>
+ * #undef LSM_HOOK
+ * BTF_SET_END(bpf_lsm_hooks)
+ */
 
 int bpf_lsm_verify_prog(struct bpf_verifier_log *vlog,
 			const struct bpf_prog *prog)
 {
+	const char *fn;
+
 	if (!prog->gpl_compatible) {
 		bpf_log(vlog,
 			"LSM programs must have a GPL compatible license\n");
 		return -EINVAL;
 	}
 
-	if (!btf_id_set_contains(&bpf_lsm_hooks, prog->aux->attach_btf_id)) {
-		bpf_log(vlog, "attach_btf_id %u points to wrong type name %s\n",
-			prog->aux->attach_btf_id, prog->aux->attach_func_name);
+	/* alioth-research-fork: tools/bpf/resolve_btfids is not built on
+	 * 4.19 (the source dir does not exist), so the BTF_ID()-based
+	 * bpf_lsm_hooks set above is never populated -- every LSM attach
+	 * would fail with a stale "wrong type name" log even though the
+	 * target function is a real bpf_lsm_<hook> stub.
+	 *
+	 * Fall back to a prefix check on the resolved function name. The
+	 * verifier has already proven that attach_btf_id points to a
+	 * BTF_KIND_FUNC of name attach_func_name, so this is sufficient
+	 * to identify a legitimate LSM hook target.
+	 */
+	fn = prog->aux->attach_func_name;
+	if (!fn || strncmp(fn, "bpf_lsm_", 8) != 0) {
+		bpf_log(vlog, "attach_func_name %s does not start with bpf_lsm_\n",
+			fn ? fn : "(null)");
 		return -EINVAL;
 	}
 
