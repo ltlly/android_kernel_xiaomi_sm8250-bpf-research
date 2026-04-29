@@ -1177,6 +1177,14 @@ BTF_SET_END(btf_allowlist_d_path)
 
 static bool bpf_d_path_allowed(const struct bpf_prog *prog)
 {
+	/* alioth-research-fork: tools/bpf/resolve_btfids is missing on
+	 * 4.19, so btf_allowlist_d_path is never populated.  Allow LSM
+	 * programs attached to bpf_lsm_*() stubs to call d_path — those
+	 * receive struct file/path arguments directly from the kernel
+	 * and have already been validated by bpf_lsm_verify_prog. */
+	if (prog->type == BPF_PROG_TYPE_LSM && prog->aux->attach_func_name &&
+	    strncmp(prog->aux->attach_func_name, "bpf_lsm_", 8) == 0)
+		return true;
 	return btf_id_set_contains(&btf_allowlist_d_path, prog->aux->attach_btf_id);
 }
 
