@@ -4380,15 +4380,27 @@ BTF_ID(struct, bpf_ctx_convert)
 /*
  * 4.19-research-fork: alioth bootloader rejects kernel Image >~64MB, so we
  * cannot ship the .BTF section in vmlinux. Instead, load BTF from a known
- * filesystem path on first verifier use. /vendor/firmware/ is mounted early
- * on Android Q+, well before any BPF tracing program would attempt to load.
+ * filesystem path on first verifier use.
  *
  * Search order — first existing file wins:
- *   1. /vendor/firmware/vmlinux.btf      (preferred — Android firmware path)
- *   2. /lib/firmware/vmlinux.btf         (standard Linux firmware path)
- *   3. /data/local/tmp/vmlinux.btf       (research/dev override)
+ *   1. /mnt/vendor/persist/vmlinux.btf   (preferred on Android — RW ext4,
+ *                                         survives factory reset; the
+ *                                         "persist" partition is dedicated
+ *                                         to data that must never be wiped:
+ *                                         calibration / MAC / modem cfg.
+ *                                         57MB total on alioth, plenty of
+ *                                         room for our 9.7MB BTF.)
+ *   2. /vendor/firmware/vmlinux.btf      (alternative — read-only EROFS;
+ *                                         only writable by repacking the
+ *                                         vendor partition image)
+ *   3. /lib/firmware/vmlinux.btf         (standard Linux firmware path —
+ *                                         present on desktop / generic
+ *                                         distros, absent on Android)
+ *   4. /data/local/tmp/vmlinux.btf       (research/dev override; lost on
+ *                                         factory reset since /data wipes)
  */
 static const char * const ksu_btf_search_paths[] = {
+	"/mnt/vendor/persist/vmlinux.btf",
 	"/vendor/firmware/vmlinux.btf",
 	"/lib/firmware/vmlinux.btf",
 	"/data/local/tmp/vmlinux.btf",
