@@ -11467,6 +11467,10 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->aux->tail_call_reachable = env->subprog_info[i].tail_call_reachable;
 		func[i] = bpf_int_jit_compile(func[i]);
 		if (!func[i]->jited) {
+			pr_err_ratelimited("bpf_jit: subprog %d/%d (len=%u) bpf_int_jit_compile failed\n",
+					   i, env->subprog_cnt, func[i]->len);
+			verbose(env, "subprog %d (len=%u) JIT failed\n",
+				i, func[i]->len);
 			err = -ENOTSUPP;
 			goto out_free;
 		}

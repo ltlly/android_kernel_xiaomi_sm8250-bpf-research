@@ -797,8 +797,12 @@ static int build_body(struct jit_ctx *ctx)
 		}
 		if (ctx->image == NULL)
 			ctx->offset[i] = ctx->idx;
-		if (ret)
+		if (ret) {
+			pr_err_ratelimited("bpf_jit: build_insn failed at insn[%d] code=0x%02x dst=%u src=%u off=%d imm=0x%08x ret=%d\n",
+					   i, insn->code, insn->dst_reg, insn->src_reg,
+					   insn->off, insn->imm, ret);
 			return ret;
+		}
 	}
 
 	return 0;
@@ -877,6 +881,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	ctx.offset = kcalloc(prog->len, sizeof(int), GFP_KERNEL);
 	if (ctx.offset == NULL) {
+		pr_err_ratelimited("bpf_jit: %s: kcalloc(offset[%u]) failed\n",
+				   prog->aux->name[0] ? prog->aux->name : "(noname)",
+				   prog->len);
 		prog = orig_prog;
 		goto out_off;
 	}
@@ -885,11 +892,15 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	/* Fake pass to fill in ctx->offset. */
 	if (build_body(&ctx)) {
+		pr_err_ratelimited("bpf_jit: %s: build_body 1st pass failed\n",
+				   prog->aux->name[0] ? prog->aux->name : "(noname)");
 		prog = orig_prog;
 		goto out_off;
 	}
 
 	if (build_prologue(&ctx, was_classic)) {
+		pr_err_ratelimited("bpf_jit: %s: build_prologue failed\n",
+				   prog->aux->name[0] ? prog->aux->name : "(noname)");
 		prog = orig_prog;
 		goto out_off;
 	}
@@ -902,6 +913,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	header = bpf_jit_binary_alloc(image_size, &image_ptr,
 				      sizeof(u32), jit_fill_hole);
 	if (header == NULL) {
+		pr_err_ratelimited("bpf_jit: %s: binary_alloc(%d) failed\n",
+				   prog->aux->name[0] ? prog->aux->name : "(noname)",
+				   image_size);
 		prog = orig_prog;
 		goto out_off;
 	}
@@ -915,6 +929,8 @@ skip_init_ctx:
 	build_prologue(&ctx, was_classic);
 
 	if (build_body(&ctx)) {
+		pr_err_ratelimited("bpf_jit: %s: build_body 2nd pass failed\n",
+				   prog->aux->name[0] ? prog->aux->name : "(noname)");
 		bpf_jit_binary_free(header);
 		prog = orig_prog;
 		goto out_off;
@@ -924,6 +940,8 @@ skip_init_ctx:
 
 	/* 3. Extra pass to validate JITed code. */
 	if (validate_code(&ctx)) {
+		pr_err_ratelimited("bpf_jit: %s: validate_code failed\n",
+				   prog->aux->name[0] ? prog->aux->name : "(noname)");
 		bpf_jit_binary_free(header);
 		prog = orig_prog;
 		goto out_off;
