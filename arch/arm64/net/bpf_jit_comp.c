@@ -651,7 +651,26 @@ emit_cond_jmp:
 	case BPF_JMP | BPF_CALL:
 	{
 		const u8 r0 = bpf2a64[BPF_REG_0];
-		const u64 func = (u64)__bpf_call_base + imm;
+		u64 func;
+
+		/* For BPF-to-BPF calls, the verifier rewrites insn->imm to be
+		 * (callee_bpf_func - __bpf_call_base) and stashes the subprog
+		 * index in insn->off. On systems where the JITed image is
+		 * allocated more than 2 GiB away from __bpf_call_base (true on
+		 * arm64 with vmalloc-area BPF allocations and a low kernel
+		 * text base), that s32 imm overflows and we reconstruct the
+		 * wrong address — leading to a BLR into garbage at run time.
+		 *
+		 * Look the address up via the subprog index instead, exactly
+		 * like the comment in jit_subprogs() suggests for powerpc64.
+		 */
+		if (insn->src_reg == BPF_PSEUDO_CALL &&
+		    ctx->prog->aux->func &&
+		    off >= 0 && off < ctx->prog->aux->func_cnt) {
+			func = (u64)ctx->prog->aux->func[off]->bpf_func;
+		} else {
+			func = (u64)__bpf_call_base + imm;
+		}
 
 		if (ctx->prog->is_func)
 			emit_addr_mov_i64(tmp, func, ctx);
